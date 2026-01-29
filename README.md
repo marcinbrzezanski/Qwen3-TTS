@@ -37,6 +37,7 @@ We release **Qwen3-TTS**, a series of powerful speech generation capabilities de
   - [DashScope API Usage](#dashscope-api-usage)
 - [vLLM Usage](#vllm-usage)
 - [Fine Tuning](#fine-tuning)
+- [Tokenizer Audit Tool](#tokenizer-audit-tool)
 - [Evaluation](#evaluation)
 - [Citation](#citation)
 
@@ -459,6 +460,58 @@ python end2end.py --query-type Base --mode-tag icl
 ## Fine Tuning
 
 Please refer to [Qwen3-TTS-Finetuning](finetuning/) for detailed instructions on fine-tuning Qwen3-TTS.
+
+## Tokenizer Audit Tool
+
+For developers working with new languages or evaluating tokenizer performance, we provide a tokenizer audit tool that analyzes the **text tokenizer** (Qwen2Tokenizer) efficiency and coverage.
+
+### Purpose
+
+The tokenizer audit tool evaluates:
+- **Tokenization efficiency**: Average tokens per character for a given language
+- **Sequence lengths**: Impact on inference performance
+- **Unknown token detection**: Whether characters produce unknown/fallback tokens
+- **Lossless encoding**: Text reconstruction quality
+
+This is particularly useful when adding support for new languages or determining if the tokenizer needs extension with language-specific vocabulary.
+
+### Usage
+
+```bash
+# Audit Polish text tokenization
+python tools/tokenizer_audit.py \
+    --model-path Qwen/Qwen3-TTS-12Hz-1.7B-Base \
+    --output polish_audit_results.json
+```
+
+The tool includes curated test samples for Polish covering:
+- News articles (formal text)
+- Conversational dialogue
+- Numbers, dates, and prices
+- Polish diacritical marks (ą, ć, ę, ł, ń, ó, ś, ź, ż)
+- Technical text and URLs
+- Mixed real-world content
+
+### Output and Recommendations
+
+The tool generates:
+1. **Console output** with real-time statistics
+2. **JSON file** with detailed metrics for each sample
+3. **Recommendations** on whether to use baseline or extend tokenizer
+
+**Interpreting Results:**
+- **Tokens/char < 0.35**: Baseline tokenizer is sufficient ✅
+- **Tokens/char 0.35-0.50**: Extension could improve performance ⚠️
+- **Tokens/char > 0.50**: Extension strongly recommended ❌
+- **Unknown tokens > 0**: Extension required ❌
+
+### CI Integration
+
+The tokenizer audit is integrated with GitHub Actions and runs automatically on PRs that modify tokenizer or model code. Results are stored as artifacts for comparison across changes.
+
+For detailed analysis and implementation guidance, see:
+- [Tokenizer Audit Tool Documentation](tools/README.md)
+- [Polish Language Tokenizer Strategy Analysis](docs/polish_tokenizer_analysis.md)
 
 ## Evaluation
 
