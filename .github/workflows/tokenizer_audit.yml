@@ -45,6 +45,13 @@ jobs:
           # Create output directory
           mkdir -p audit_results
           
+          # Validate model path (basic sanitization)
+          # Only allow alphanumeric, hyphens, underscores, slashes, and dots
+          if ! echo "$MODEL_PATH" | grep -qE '^[a-zA-Z0-9/_.-]+$'; then
+            echo "Error: Invalid model path format" >&2
+            exit 1
+          fi
+          
           # Run the audit script
           # Note: This will fail if model is not publicly available
           # For now, we'll handle this gracefully
@@ -61,6 +68,7 @@ jobs:
       - name: Generate summary
         if: always()
         run: |
+          set -e  # Exit on error
           if [ -f audit_results/tokenizer_audit_results.json ]; then
             echo "## Tokenizer Audit Results" > audit_results/summary.md
             echo "" >> audit_results/summary.md
@@ -68,7 +76,7 @@ jobs:
             echo "" >> audit_results/summary.md
             
             # Extract key metrics using Python
-            python << 'EOF'
+            python << 'EOF' || echo "Warning: Failed to generate detailed summary"
           import json
           import sys
           
@@ -151,7 +159,7 @@ jobs:
               
               comment += '\n\n📊 Full results are available as workflow artifacts.';
               
-              // Find existing comment
+              // Find existing comment from GitHub Actions bot
               const { data: comments } = await github.rest.issues.listComments({
                 owner: context.repo.owner,
                 repo: context.repo.repo,
@@ -159,7 +167,7 @@ jobs:
               });
               
               const botComment = comments.find(comment => 
-                comment.user.type === 'Bot' && 
+                comment.user.login === 'github-actions[bot]' && 
                 comment.body.includes('Tokenizer Audit Results')
               );
               
