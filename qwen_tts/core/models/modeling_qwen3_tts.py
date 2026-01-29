@@ -44,6 +44,7 @@ from transformers.utils import can_return_tuple, logging
 from transformers.utils.hub import cached_file
 
 from ...inference.qwen3_tts_tokenizer import Qwen3TTSTokenizer
+from ...langs.registry import LanguageRegistry
 from .configuration_qwen3_tts import (Qwen3TTSConfig,
                                       Qwen3TTSSpeakerEncoderConfig,
                                       Qwen3TTSTalkerCodePredictorConfig,
@@ -1833,6 +1834,9 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
             if "dialect" not in language_id:
                 self.supported_languages.append(language_id)
         
+        # Initialize language registry for normalization and resolution
+        self.language_registry = LanguageRegistry(self.config.talker_config.codec_language_id)
+        
         self.speaker_encoder_sample_rate = self.config.speaker_encoder_config.sample_rate
         self.tokenizer_type = self.config.tokenizer_type
         self.tts_model_size = self.config.tts_model_size
@@ -2039,6 +2043,7 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
         subtalker_temperature: float = 0.9,
         eos_token_id: Optional[int] = None,
         repetition_penalty: float = 1.05,
+        strict_language: bool = False,  # If True, raise error for unknown languages; if False, fallback to auto
         **kwargs,
     ):
         talker_kwargs = {
@@ -2107,15 +2112,10 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
 
             assert language is not None
 
-            if language.lower() == "auto":
-                language_id = None
-            else:
-                if language.lower() not in self.config.talker_config.codec_language_id:
-                    raise NotImplementedError(f"Language {language} not implemented")
-                else:
-                    language_id = self.config.talker_config.codec_language_id[language.lower()]
+            # Use language registry for normalization and resolution
+            language_id = self.language_registry.resolve_language(language, strict=strict_language)
             
-            if (language.lower() in ["chinese", "auto"] and \
+            if (self.language_registry.normalize_language(language) in ["chinese", "auto"] and \
                    speaker != "" and speaker is not None and \
                      self.config.talker_config.spk_is_dialect[speaker.lower()] != False):
                 dialect = self.config.talker_config.spk_is_dialect[speaker.lower()]
