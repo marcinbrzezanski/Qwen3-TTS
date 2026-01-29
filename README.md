@@ -459,7 +459,30 @@ python end2end.py --query-type Base --mode-tag icl
 
 ## Fine Tuning
 
-Please refer to [Qwen3-TTS-Finetuning](finetuning/) for detailed instructions on fine-tuning Qwen3-TTS.
+We provide two types of fine-tuning:
+
+### Speaker Fine-Tuning
+Fine-tune the model on a new speaker's voice. Please refer to [Qwen3-TTS-Finetuning](finetuning/) for detailed instructions.
+
+### Language Fine-Tuning
+Fine-tune the model for new language support with three training modes:
+- **`lang_only`**: Most efficient - only updates language embeddings (~1-2% of parameters)
+- **`lora`**: Efficient - uses LoRA for parameter-efficient fine-tuning (~5-10% of parameters)  
+- **`full`**: Complete - full model fine-tuning (all parameters, highest quality)
+
+Quick example:
+```bash
+# Fine-tune for a new language (e.g., Polish)
+python scripts/finetune_language.py \
+  --init_model_path Qwen/Qwen3-TTS-12Hz-1.7B-Base \
+  --train_jsonl data/polish_train_with_codes.jsonl \
+  --output_dir output/polish_lang_only \
+  --train_mode lang_only \
+  --target_language polish \
+  --num_epochs 10
+```
+
+For comprehensive documentation, see [Language Fine-Tuning Guide](docs/LANGUAGE_FINETUNING.md).
 
 ## Tokenizer Audit Tool
 
