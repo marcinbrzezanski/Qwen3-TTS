@@ -2043,7 +2043,7 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
         subtalker_temperature: float = 0.9,
         eos_token_id: Optional[int] = None,
         repetition_penalty: float = 1.05,
-        strict_language: bool = False,
+        strict_language: bool = False,  # If True, raise error for unknown languages; if False, fallback to auto
         **kwargs,
     ):
         talker_kwargs = {

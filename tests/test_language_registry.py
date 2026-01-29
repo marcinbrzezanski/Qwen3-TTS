@@ -109,13 +109,13 @@ class TestLanguageRegistry:
     def test_resolve_language_unsupported_strict(self):
         """Test resolution of unsupported language in strict mode."""
         # Should raise NotImplementedError
-        with pytest.raises(NotImplementedError, match="Language polish not implemented"):
+        with pytest.raises(NotImplementedError, match="Language 'polish'.*not implemented"):
             self.registry.resolve_language("polish", strict=True)
         
-        with pytest.raises(NotImplementedError, match="Language french not implemented"):
+        with pytest.raises(NotImplementedError, match="Language 'french'.*not implemented"):
             self.registry.resolve_language("french", strict=True)
         
-        with pytest.raises(NotImplementedError, match="Language unknown_lang not implemented"):
+        with pytest.raises(NotImplementedError, match="Language 'unknown_lang'.*not implemented"):
             self.registry.resolve_language("unknown_lang", strict=True)
     
     def test_resolve_language_polish_variants(self):

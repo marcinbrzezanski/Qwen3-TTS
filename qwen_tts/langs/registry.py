@@ -39,12 +39,12 @@ class LanguageRegistry:
         
         # Japanese
         "ja": "japanese",
-        "jp": "japanese",
+        "jp": "japanese",  # Non-standard (country code), but commonly misused
         "jpn": "japanese",
         
         # Korean
         "ko": "korean",
-        "kr": "korean",
+        "kr": "korean",  # Non-standard (country code), but commonly misused
         "kor": "korean",
         
         # German
@@ -169,7 +169,8 @@ class LanguageRegistry:
         
         # Handle unknown language based on strict mode
         if strict:
-            raise NotImplementedError(f"Language {language} not implemented")
+            # Use normalized form for clearer error message
+            raise NotImplementedError(f"Language '{normalized}' (from input '{language}') not implemented")
         
         # Fallback: treat unknown language as "auto" (no language token)
         return None
