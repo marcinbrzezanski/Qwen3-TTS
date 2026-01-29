@@ -26,7 +26,6 @@ to a real language_id and not fallback to "auto".
 """
 
 import argparse
-import json
 import os
 from pathlib import Path
 from typing import Dict, Optional, Any
@@ -37,21 +36,17 @@ from transformers import AutoConfig
 from qwen_tts.core.models import Qwen3TTSForConditionalGeneration, Qwen3TTSConfig
 
 
-def find_next_available_language_id(config: Qwen3TTSConfig) -> int:
+def get_all_used_token_ids(config: Qwen3TTSConfig, exclude_language: Optional[str] = None) -> set:
     """
-    Find the next available language ID token.
-    
-    Strategy: Look for the maximum ID in the reserved codec token range
-    and return the next one. The codec uses special tokens in the 4196-4205
-    range, so we start looking after those.
+    Get all token IDs currently in use (special tokens and language IDs).
     
     Args:
         config: The model configuration
+        exclude_language: Optional language name to exclude from language ID collection
         
     Returns:
-        Next available language ID (integer)
+        Set of all used token IDs
     """
-    # Collect all used IDs from special tokens
     used_ids = set()
     
     # Add special codec tokens
@@ -72,7 +67,29 @@ def find_next_available_language_id(config: Qwen3TTSConfig) -> int:
     
     # Add existing language IDs
     if config.talker_config.codec_language_id:
-        used_ids.update(config.talker_config.codec_language_id.values())
+        for lang, lid in config.talker_config.codec_language_id.items():
+            if exclude_language is None or lang != exclude_language:
+                used_ids.add(lid)
+    
+    return used_ids
+
+
+def find_next_available_language_id(config: Qwen3TTSConfig) -> int:
+    """
+    Find the next available language ID token.
+    
+    Strategy: Look for the maximum ID in the reserved codec token range
+    and return the next one. The codec uses special tokens in the 4196-4205
+    range, so we start looking after those.
+    
+    Args:
+        config: The model configuration
+        
+    Returns:
+        Next available language ID (integer)
+    """
+    # Get all used IDs
+    used_ids = get_all_used_token_ids(config)
     
     # Find the max ID in the codec range and return next available
     if used_ids:
@@ -186,25 +203,7 @@ def register_language(
         language_id = find_next_available_language_id(config)
     else:
         # Validate that explicit language_id doesn't conflict
-        used_ids = set()
-        if hasattr(config.talker_config, 'codec_pad_id') and config.talker_config.codec_pad_id is not None:
-            used_ids.add(config.talker_config.codec_pad_id)
-        if hasattr(config.talker_config, 'codec_bos_id') and config.talker_config.codec_bos_id is not None:
-            used_ids.add(config.talker_config.codec_bos_id)
-        if hasattr(config.talker_config, 'codec_eos_token_id') and config.talker_config.codec_eos_token_id is not None:
-            used_ids.add(config.talker_config.codec_eos_token_id)
-        if hasattr(config.talker_config, 'codec_think_id') and config.talker_config.codec_think_id is not None:
-            used_ids.add(config.talker_config.codec_think_id)
-        if hasattr(config.talker_config, 'codec_nothink_id') and config.talker_config.codec_nothink_id is not None:
-            used_ids.add(config.talker_config.codec_nothink_id)
-        if hasattr(config.talker_config, 'codec_think_bos_id') and config.talker_config.codec_think_bos_id is not None:
-            used_ids.add(config.talker_config.codec_think_bos_id)
-        if hasattr(config.talker_config, 'codec_think_eos_id') and config.talker_config.codec_think_eos_id is not None:
-            used_ids.add(config.talker_config.codec_think_eos_id)
-        if config.talker_config.codec_language_id:
-            for lang, lid in config.talker_config.codec_language_id.items():
-                if lang != language_normalized:  # Allow overwriting same language
-                    used_ids.add(lid)
+        used_ids = get_all_used_token_ids(config, exclude_language=language_normalized)
         
         if language_id in used_ids:
             raise ValueError(
@@ -302,7 +301,7 @@ Examples:
         "--model_path",
         type=str,
         required=True,
-        help="Path to the base model checkpoint (local directory or HuggingFace repo)"
+        help="Path to the base model checkpoint (local directory or Hugging Face repo)"
     )
     parser.add_argument(
         "--language",

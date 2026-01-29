@@ -13,11 +13,9 @@ Tests language token registration functionality including:
 - Error handling
 """
 
-import json
 import os
 import tempfile
 import shutil
-from pathlib import Path
 from unittest import mock
 
 import pytest
@@ -29,7 +27,54 @@ from scripts.register_language import (
     check_embedding_resize_needed,
     resize_embeddings,
     register_language,
+    get_all_used_token_ids,
 )
+
+
+class TestGetAllUsedTokenIds:
+    """Test cases for the get_all_used_token_ids helper function."""
+    
+    def test_collects_all_special_tokens(self):
+        """Test that all special token IDs are collected."""
+        config = Qwen3TTSConfig()
+        # Default config has special tokens
+        used_ids = get_all_used_token_ids(config)
+        
+        # Should include all default special tokens
+        assert config.talker_config.codec_pad_id in used_ids
+        assert config.talker_config.codec_bos_id in used_ids
+        assert config.talker_config.codec_eos_token_id in used_ids
+        assert config.talker_config.codec_think_id in used_ids
+        assert config.talker_config.codec_nothink_id in used_ids
+        assert config.talker_config.codec_think_bos_id in used_ids
+        assert config.talker_config.codec_think_eos_id in used_ids
+    
+    def test_collects_language_ids(self):
+        """Test that language IDs are collected."""
+        config = Qwen3TTSConfig()
+        config.talker_config.codec_language_id = {
+            "chinese": 4200,
+            "english": 4201,
+        }
+        
+        used_ids = get_all_used_token_ids(config)
+        assert 4200 in used_ids
+        assert 4201 in used_ids
+    
+    def test_exclude_language_parameter(self):
+        """Test that exclude_language parameter works."""
+        config = Qwen3TTSConfig()
+        config.talker_config.codec_language_id = {
+            "chinese": 4200,
+            "english": 4201,
+            "polish": 4210,  # Use ID after special tokens
+        }
+        
+        # Exclude polish
+        used_ids = get_all_used_token_ids(config, exclude_language="polish")
+        assert 4200 in used_ids
+        assert 4201 in used_ids
+        assert 4210 not in used_ids
 
 
 class TestFindNextAvailableLanguageId:
