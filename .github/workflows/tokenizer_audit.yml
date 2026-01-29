@@ -1,0 +1,185 @@
+name: 'Tokenizer Audit'
+
+on:
+  pull_request:
+    branches: [ main, master ]
+    paths:
+      - 'qwen_tts/core/models/**'
+      - 'qwen_tts/langs/**'
+      - 'tools/tokenizer_audit.py'
+  workflow_dispatch:
+    inputs:
+      model_path:
+        description: 'HuggingFace model path or local path'
+        required: false
+        default: 'Qwen/Qwen3-TTS-12Hz-1.7B-Base'
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install transformers torch numpy
+
+      - name: Run tokenizer audit
+        id: audit
+        env:
+          # Use workflow input if provided, otherwise use default
+          MODEL_PATH: ${{ github.event.inputs.model_path || 'Qwen/Qwen3-TTS-12Hz-1.7B-Base' }}
+        run: |
+          # Create output directory
+          mkdir -p audit_results
+          
+          # Run the audit script
+          # Note: This will fail if model is not publicly available
+          # For now, we'll handle this gracefully
+          if python tools/tokenizer_audit.py \
+              --model-path "$MODEL_PATH" \
+              --output audit_results/tokenizer_audit_results.json; then
+            echo "audit_status=success" >> $GITHUB_OUTPUT
+          else
+            echo "audit_status=failed" >> $GITHUB_OUTPUT
+            echo "⚠️ Audit failed - model may not be publicly available yet" >> audit_results/summary.txt
+          fi
+        continue-on-error: true
+
+      - name: Generate summary
+        if: always()
+        run: |
+          if [ -f audit_results/tokenizer_audit_results.json ]; then
+            echo "## Tokenizer Audit Results" > audit_results/summary.md
+            echo "" >> audit_results/summary.md
+            echo "### Overall Statistics" >> audit_results/summary.md
+            echo "" >> audit_results/summary.md
+            
+            # Extract key metrics using Python
+            python << 'EOF'
+          import json
+          import sys
+          
+          try:
+              with open('audit_results/tokenizer_audit_results.json', 'r') as f:
+                  data = json.load(f)
+              
+              overall = data['overall_statistics']
+              
+              summary = f"""
+          - **Total samples**: {overall['total_samples']}
+          - **Avg tokens/char**: {overall['avg_tokens_per_char']:.3f} ± {overall['std_tokens_per_char']:.3f}
+          - **Min/Max tokens/char**: {overall['min_tokens_per_char']:.3f} / {overall['max_tokens_per_char']:.3f}
+          - **Avg sequence length**: {overall['avg_sequence_length']:.1f} tokens
+          - **Max sequence length**: {overall['max_sequence_length']} tokens
+          - **Unknown tokens**: {overall['total_unk_tokens']}
+          - **Lossless encoding rate**: {overall['lossless_encoding_rate']*100:.1f}%
+          
+          ### Recommendations
+          
+          """
+              
+              # Add recommendations
+              if overall['avg_tokens_per_char'] > 0.5:
+                  summary += "⚠️ **HIGH tokens/char ratio** - Consider extending tokenizer with Polish vocabulary.\n\n"
+              elif overall['avg_tokens_per_char'] > 0.35:
+                  summary += "⚠️ **MODERATE efficiency** - Baseline may work, but extension could help.\n\n"
+              else:
+                  summary += "✅ **GOOD efficiency** - Baseline tokenizer appears sufficient.\n\n"
+              
+              if overall['total_unk_tokens'] > 0:
+                  summary += f"⚠️ **WARNING**: Found {overall['total_unk_tokens']} unknown tokens - Extension REQUIRED.\n\n"
+              else:
+                  summary += "✅ No unknown tokens detected.\n\n"
+              
+              if overall['lossless_encoding_rate'] < 1.0:
+                  summary += f"⚠️ Only {overall['lossless_encoding_rate']*100:.1f}% lossless encoding.\n\n"
+              else:
+                  summary += "✅ 100% lossless encoding.\n\n"
+              
+              with open('audit_results/summary.md', 'a') as f:
+                  f.write(summary)
+              
+              print("Summary generated successfully")
+          except Exception as e:
+              print(f"Error generating summary: {e}", file=sys.stderr)
+              sys.exit(0)  # Don't fail the workflow
+          EOF
+          fi
+
+      - name: Upload audit results as artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tokenizer-audit-results
+          path: audit_results/
+          retention-days: 90
+
+      - name: Comment PR with summary
+        if: github.event_name == 'pull_request' && always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            let comment = '## 🔍 Tokenizer Audit Results\n\n';
+            
+            try {
+              if (fs.existsSync('audit_results/summary.md')) {
+                const summary = fs.readFileSync('audit_results/summary.md', 'utf8');
+                comment += summary;
+              } else {
+                comment += '⚠️ Audit could not be completed. This may be because:\n';
+                comment += '- The model is not publicly available yet\n';
+                comment += '- Required dependencies are missing\n\n';
+                comment += 'Please run the audit script locally:\n';
+                comment += '```bash\n';
+                comment += 'python tools/tokenizer_audit.py --model-path <model-path>\n';
+                comment += '```\n';
+              }
+              
+              comment += '\n\n📊 Full results are available as workflow artifacts.';
+              
+              // Find existing comment
+              const { data: comments } = await github.rest.issues.listComments({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+              });
+              
+              const botComment = comments.find(comment => 
+                comment.user.type === 'Bot' && 
+                comment.body.includes('Tokenizer Audit Results')
+              );
+              
+              if (botComment) {
+                // Update existing comment
+                await github.rest.issues.updateComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  comment_id: botComment.id,
+                  body: comment
+                });
+              } else {
+                // Create new comment
+                await github.rest.issues.createComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: context.issue.number,
+                  body: comment
+                });
+              }
+            } catch (error) {
+              console.log('Error posting comment:', error);
+            }
