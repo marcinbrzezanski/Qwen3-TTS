@@ -29,7 +29,7 @@ import argparse
 import json
 import os
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, Optional, Any
 
 import torch
 from transformers import AutoConfig
@@ -146,7 +146,7 @@ def register_language(
     output_path: str,
     language_id: Optional[int] = None,
     force: bool = False
-) -> Dict[str, any]:
+) -> Dict[str, Any]:
     """
     Register a new language in a TTS model checkpoint.
     
@@ -184,6 +184,33 @@ def register_language(
     # Determine language ID
     if language_id is None:
         language_id = find_next_available_language_id(config)
+    else:
+        # Validate that explicit language_id doesn't conflict
+        used_ids = set()
+        if hasattr(config.talker_config, 'codec_pad_id') and config.talker_config.codec_pad_id is not None:
+            used_ids.add(config.talker_config.codec_pad_id)
+        if hasattr(config.talker_config, 'codec_bos_id') and config.talker_config.codec_bos_id is not None:
+            used_ids.add(config.talker_config.codec_bos_id)
+        if hasattr(config.talker_config, 'codec_eos_token_id') and config.talker_config.codec_eos_token_id is not None:
+            used_ids.add(config.talker_config.codec_eos_token_id)
+        if hasattr(config.talker_config, 'codec_think_id') and config.talker_config.codec_think_id is not None:
+            used_ids.add(config.talker_config.codec_think_id)
+        if hasattr(config.talker_config, 'codec_nothink_id') and config.talker_config.codec_nothink_id is not None:
+            used_ids.add(config.talker_config.codec_nothink_id)
+        if hasattr(config.talker_config, 'codec_think_bos_id') and config.talker_config.codec_think_bos_id is not None:
+            used_ids.add(config.talker_config.codec_think_bos_id)
+        if hasattr(config.talker_config, 'codec_think_eos_id') and config.talker_config.codec_think_eos_id is not None:
+            used_ids.add(config.talker_config.codec_think_eos_id)
+        if config.talker_config.codec_language_id:
+            for lang, lid in config.talker_config.codec_language_id.items():
+                if lang != language_normalized:  # Allow overwriting same language
+                    used_ids.add(lid)
+        
+        if language_id in used_ids:
+            raise ValueError(
+                f"Language ID {language_id} conflicts with existing token IDs. "
+                f"Used IDs: {sorted(used_ids)}"
+            )
     
     print(f"Registering language '{language_normalized}' with ID {language_id}")
     
@@ -196,12 +223,15 @@ def register_language(
         low_cpu_mem_usage=True,
     )
     
+    # Store old vocab size before any modifications
+    old_vocab_size = model.config.talker_config.vocab_size
+    
     # Check if embedding resize is needed
     resize_needed = check_embedding_resize_needed(model, language_id)
     
     if resize_needed:
         new_vocab_size = language_id + 1
-        print(f"Resizing codec embeddings from {model.config.talker_config.vocab_size} to {new_vocab_size}")
+        print(f"Resizing codec embeddings from {old_vocab_size} to {new_vocab_size}")
         resize_embeddings(model, new_vocab_size)
     else:
         print("No embedding resize needed")
@@ -210,8 +240,9 @@ def register_language(
     config.talker_config.codec_language_id[language_normalized] = language_id
     model.config.talker_config.codec_language_id[language_normalized] = language_id
     
-    # Update supported languages in model
-    model.supported_languages.append(language_normalized)
+    # Update supported languages in model (avoid duplicates)
+    if language_normalized not in model.supported_languages:
+        model.supported_languages.append(language_normalized)
     
     # Refresh language registry
     from qwen_tts.langs.registry import LanguageRegistry
@@ -232,7 +263,7 @@ def register_language(
         "language": language_normalized,
         "language_id": language_id,
         "resized": resize_needed,
-        "old_vocab_size": model.config.talker_config.vocab_size - (1 if resize_needed else 0),
+        "old_vocab_size": old_vocab_size,
         "new_vocab_size": model.config.talker_config.vocab_size,
         "output_path": output_path,
     }

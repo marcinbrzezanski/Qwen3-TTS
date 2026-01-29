@@ -397,6 +397,61 @@ class TestRegisterLanguageIntegration:
             
             # Should not need resize
             assert result["resized"] is False
+    
+    def test_explicit_language_id_conflict(self):
+        """Test that explicit language ID conflicts are detected."""
+        with mock.patch('scripts.register_language.AutoConfig.from_pretrained') as mock_config_load:
+            mock_config = Qwen3TTSConfig()
+            mock_config.talker_config.codec_language_id = {
+                "chinese": 4200,
+                "english": 4201,
+            }
+            # Set special tokens
+            mock_config.talker_config.codec_think_id = 4202
+            mock_config_load.return_value = mock_config
+            
+            # Try to register with conflicting ID
+            with pytest.raises(ValueError, match="conflicts with existing token IDs"):
+                register_language(
+                    model_path=self.model_path,
+                    language="polish",
+                    output_path=self.output_path,
+                    language_id=4202,  # Conflicts with codec_think_id
+                )
+    
+    def test_no_duplicate_in_supported_languages(self):
+        """Test that re-registering doesn't create duplicate entries."""
+        with mock.patch('scripts.register_language.AutoConfig.from_pretrained') as mock_config_load, \
+             mock.patch('scripts.register_language.Qwen3TTSForConditionalGeneration.from_pretrained') as mock_from_pretrained:
+            
+            mock_config = Qwen3TTSConfig()
+            mock_config.talker_config.codec_language_id = {
+                "chinese": 4200,
+                "polish": 4201,  # Already exists
+            }
+            mock_config.talker_config.vocab_size = 5000
+            mock_config.talker_config.initializer_range = 0.02
+            mock_config.talker_config.hidden_size = 512
+            mock_config_load.return_value = mock_config
+            
+            mock_model = mock.MagicMock()
+            mock_embedding = torch.nn.Embedding(5000, 512)
+            mock_model.talker.model.codec_embedding = mock_embedding
+            mock_model.config = mock_config
+            mock_model.supported_languages = ["chinese", "polish"]  # Polish already in list
+            
+            mock_from_pretrained.return_value = mock_model
+            
+            # Re-register polish with force
+            result = register_language(
+                model_path=self.model_path,
+                language="polish",
+                output_path=self.output_path,
+                force=True,
+            )
+            
+            # Verify no duplicate was added (supported_languages should still have polish once)
+            assert mock_model.supported_languages.count("polish") == 1
 
 
 class TestLanguageRegistryIntegration:
