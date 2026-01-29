@@ -122,7 +122,11 @@ def test_smoke_test_data_exists():
         lines = f.readlines()
         assert len(lines) > 0, "Smoke test data is empty"
         
-        for line in lines:
+        for i, line in enumerate(lines):
+            # Skip empty lines
+            if not line.strip():
+                continue
+            
             data = json.loads(line)
             assert 'audio' in data
             assert 'text' in data

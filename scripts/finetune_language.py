@@ -149,6 +149,8 @@ class LanguageDataset(torch.utils.data.Dataset):
         wav, sr = self._load_audio_to_np(ref_audio_list[0])
         ref_mel = self.extract_mels(audio=wav, sr=sr)
         
+        # Remove last 5 tokens which are typically special end tokens
+        # This matches the format expected by the model during training
         return {
             "text_ids": text_ids[:, :-5],
             "audio_codes": audio_codes,
@@ -188,11 +190,12 @@ class LanguageDataset(torch.utils.data.Dataset):
             text_embedding_mask[i, :8+text_ids_len+codec_ids_len] = True
             
             # codec channel
+            # Position 6 is reserved for speaker embedding (value 0 is placeholder)
             input_ids[i, 3:8, 1] = torch.tensor([
                 self.config.talker_config.codec_nothink_id,
                 self.config.talker_config.codec_think_bos_id,
                 self.config.talker_config.codec_think_eos_id,
-                0,  # for speaker embedding
+                0,  # speaker embedding placeholder
                 self.config.talker_config.codec_pad_id
             ])
             input_ids[i, 8:8+text_ids_len-3, 1] = self.config.talker_config.codec_pad_id
@@ -274,6 +277,9 @@ def freeze_all_except_language_embeddings(model, language_id: Optional[int] = No
         model: The model to freeze
         language_id: The specific language ID to train (if known)
     """
+    # Number of top layers to unfreeze for adaptation
+    NUM_LAYERS_TO_UNFREEZE = 2
+    
     # First, freeze everything
     for param in model.parameters():
         param.requires_grad = False
@@ -295,14 +301,13 @@ def freeze_all_except_language_embeddings(model, language_id: Optional[int] = No
     # Optionally unfreeze a few top layers for adaptation
     # This allows the model to adapt to the new language slightly
     num_layers = model.talker.model.config.num_hidden_layers
-    layers_to_unfreeze = 2  # Unfreeze last 2 layers
     
-    for i in range(num_layers - layers_to_unfreeze, num_layers):
+    for i in range(num_layers - NUM_LAYERS_TO_UNFREEZE, num_layers):
         layer = model.talker.model.layers[i]
         for param in layer.parameters():
             param.requires_grad = True
     
-    print(f"Unfroze last {layers_to_unfreeze} transformer layers for adaptation")
+    print(f"Unfroze last {NUM_LAYERS_TO_UNFREEZE} transformer layers for adaptation")
     
     # Print trainable parameters
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -330,7 +335,7 @@ def save_checkpoint(
         model: The model to save
         optimizer: The optimizer state to save
         scheduler: The scheduler state to save
-        epoch: Current epoch number
+        epoch: Current epoch number (1-indexed for checkpoint naming)
         step: Current step number
         output_dir: Output directory for checkpoints
         model_path: Original model path (for copying config files)
@@ -413,7 +418,7 @@ def load_checkpoint(checkpoint_dir: str, model, optimizer, scheduler):
         scheduler: Scheduler to load state into
         
     Returns:
-        Tuple of (epoch, step) to resume from
+        Tuple of (epoch-1, step) where epoch is 0-indexed for use in training loop
     """
     training_state_path = os.path.join(checkpoint_dir, 'training_state.pt')
     
@@ -422,9 +427,14 @@ def load_checkpoint(checkpoint_dir: str, model, optimizer, scheduler):
     
     print(f"Loading checkpoint from {checkpoint_dir}")
     
-    # Load training state
-    training_state = torch.load(training_state_path)
-    epoch = training_state['epoch']
+    # Load training state with explicit settings for PyTorch 2.0+
+    training_state = torch.load(
+        training_state_path,
+        map_location='cpu',
+        weights_only=False  # Required for optimizer/scheduler state dicts
+    )
+    # Epoch is stored as 1-indexed, convert back to 0-indexed for training loop
+    epoch = training_state['epoch'] - 1
     step = training_state['step']
     
     # Load optimizer state
@@ -434,7 +444,7 @@ def load_checkpoint(checkpoint_dir: str, model, optimizer, scheduler):
     if scheduler and training_state['scheduler_state_dict']:
         scheduler.load_state_dict(training_state['scheduler_state_dict'])
     
-    print(f"Resumed from epoch {epoch}, step {step}")
+    print(f"Resumed from checkpoint epoch {epoch + 1}, step {step}")
     
     return epoch, step
 
@@ -708,7 +718,8 @@ Examples:
     # Load data
     accelerator.print(f"Loading training data from {args.train_jsonl}...")
     with open(args.train_jsonl, 'r') as f:
-        train_data = [json.loads(line) for line in f]
+        # Filter out empty lines before parsing JSON
+        train_data = [json.loads(line) for line in f if line.strip()]
     
     accelerator.print(f"Loaded {len(train_data)} training samples")
     
@@ -751,6 +762,7 @@ Examples:
     start_epoch = 0
     start_step = 0
     if args.resume_from_checkpoint:
+        # load_checkpoint returns the 0-indexed epoch to start from
         start_epoch, start_step = load_checkpoint(
             args.resume_from_checkpoint,
             model,
@@ -792,7 +804,7 @@ Examples:
                 codec_0_labels = batch['codec_0_labels']
                 codec_mask = batch['codec_mask']
                 
-                # Get speaker embedding
+                # Get speaker embedding (frozen - not trained during language fine-tuning)
                 speaker_embedding = model.speaker_encoder(
                     ref_mels.to(model.device).to(model.dtype)
                 ).detach()
@@ -807,8 +819,10 @@ Examples:
                 
                 input_embeddings = input_text_embedding + input_codec_embedding
                 
-                # Add codec embeddings
-                for i in range(1, 16):
+                # Add codec embeddings for all 15 remaining codec channels (1-15)
+                # The model uses 16 total codec channels (0-15)
+                NUM_CODEC_CHANNELS = 16
+                for i in range(1, NUM_CODEC_CHANNELS):
                     codec_i_embedding = model.talker.code_predictor.get_input_embeddings()[i - 1](
                         codec_ids[:, :, i]
                     )
@@ -874,12 +888,13 @@ Examples:
             
             # Save checkpoint at intervals if specified
             if args.save_steps and (step + 1) % args.save_steps == 0:
+                # Save with 1-indexed epoch number for clarity
                 save_checkpoint(
                     accelerator,
                     model,
                     optimizer,
                     scheduler,
-                    epoch,
+                    epoch + 1,  # Save as 1-indexed
                     step + 1,
                     args.output_dir,
                     args.init_model_path,
@@ -890,12 +905,13 @@ Examples:
         avg_epoch_loss = epoch_loss / num_batches
         accelerator.print(f"Epoch {epoch + 1} completed | Average loss: {avg_epoch_loss:.4f}")
         
+        # Save with 1-indexed epoch number for clarity (epoch 0 becomes checkpoint-epoch-1)
         save_checkpoint(
             accelerator,
             model,
             optimizer,
             scheduler,
-            epoch,
+            epoch + 1,  # Save as 1-indexed
             global_step,
             args.output_dir,
             args.init_model_path,

@@ -64,6 +64,10 @@ def test_smoke_data_exists():
         with open(path, 'r') as f:
             lines = f.readlines()
             for i, line in enumerate(lines):
+                # Skip empty lines
+                if not line.strip():
+                    continue
+                
                 try:
                     data = json.loads(line)
                     required_fields = ['audio', 'text', 'ref_audio', 'audio_codes']
