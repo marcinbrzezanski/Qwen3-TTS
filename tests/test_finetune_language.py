@@ -151,3 +151,111 @@ def test_checkpoint_functions_exist():
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+def test_language_embedding_gradient_mask_keeps_only_target_row():
+    """Test that gradient masking keeps only the target embedding row gradients."""
+    import torch
+    from scripts.finetune_language import register_language_embedding_gradient_mask
+
+    class _MockCore(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.codec_embedding = torch.nn.Embedding(8, 4)
+            self.layers = torch.nn.ModuleList([torch.nn.Linear(4, 4) for _ in range(2)])
+            self.config = type('obj', (object,), {'num_hidden_layers': 2})()
+
+    class _MockTalker(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.model = _MockCore()
+
+    class _MockModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.talker = _MockTalker()
+
+    model = _MockModel()
+    handle = register_language_embedding_gradient_mask(model, language_id=3)
+
+    emb = model.talker.model.codec_embedding
+    emb.weight.grad = None
+    emb.weight.sum().backward()
+
+    grad = emb.weight.grad
+    assert grad is not None
+    non_zero_rows = (grad.abs().sum(dim=1) > 0).nonzero(as_tuple=False).flatten().tolist()
+    assert non_zero_rows == [3]
+
+    handle.remove()
+
+
+def test_language_embedding_gradient_mask_raises_for_out_of_range_id():
+    """Test out-of-range language_id validation."""
+    import torch
+    from scripts.finetune_language import register_language_embedding_gradient_mask
+
+    class _MockCore(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.codec_embedding = torch.nn.Embedding(4, 2)
+
+    class _MockTalker(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.model = _MockCore()
+
+    class _MockModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.talker = _MockTalker()
+
+    model = _MockModel()
+    with pytest.raises(ValueError, match="out of codec_embedding range"):
+        register_language_embedding_gradient_mask(model, language_id=10)
+
+
+def test_create_optimizer_disables_decay_for_masked_embedding_row():
+    """Embedding param group should have zero decay when language row masking is active."""
+    import torch
+    from scripts.finetune_language import create_optimizer
+
+    class _MockCore(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.codec_embedding = torch.nn.Embedding(8, 4)
+            self.layers = torch.nn.ModuleList([torch.nn.Linear(4, 4) for _ in range(2)])
+            self.config = type('obj', (object,), {'num_hidden_layers': 2})()
+
+    class _MockTalker(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.model = _MockCore()
+
+    class _MockModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.talker = _MockTalker()
+
+    model = _MockModel()
+    model.talker.model.codec_embedding.weight.requires_grad = True
+    for layer in model.talker.model.layers:
+        for param in layer.parameters():
+            param.requires_grad = True
+
+    optimizer = create_optimizer(model, learning_rate=1e-4, weight_decay=0.1, language_id=3)
+
+    embedding_param = model.talker.model.codec_embedding.weight
+    embedding_group = next(
+        group for group in optimizer.param_groups
+        if any(id(param) == id(embedding_param) for param in group['params'])
+    )
+    assert embedding_group['weight_decay'] == 0.0
+
+    non_embedding_groups = [
+        group for group in optimizer.param_groups
+        if len(group['params']) > 0
+        and all(id(param) != id(embedding_param) for param in group['params'])
+    ]
+    assert non_embedding_groups
+    assert all(group['weight_decay'] == 0.1 for group in non_embedding_groups)
