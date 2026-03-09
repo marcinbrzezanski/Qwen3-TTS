@@ -352,6 +352,42 @@ def freeze_all_except_language_embeddings(model, language_id: Optional[int] = No
     return language_row_hook
 
 
+def create_optimizer(model, learning_rate: float, weight_decay: float, language_id: Optional[int] = None):
+    """Create AdamW optimizer with safe weight decay behavior for lang_only row masking.
+
+    When `language_id` is set, the codec embedding uses row-level gradient masking.
+    In that mode, decoupled weight decay must be disabled for the embedding tensor,
+    otherwise non-target rows would still drift.
+    """
+    embedding_weight = None
+    if (
+        language_id is not None
+        and hasattr(model, 'talker')
+        and hasattr(model.talker, 'model')
+        and hasattr(model.talker.model, 'codec_embedding')
+    ):
+        embedding_weight = model.talker.model.codec_embedding.weight
+
+    if embedding_weight is None:
+        return AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
+
+    embedding_id = id(embedding_weight)
+    other_trainable_params = [
+        param for param in model.parameters() if param.requires_grad and id(param) != embedding_id
+    ]
+
+    param_groups = [
+        {
+            'params': [embedding_weight],
+            'weight_decay': 0.0,
+        }
+    ]
+    if other_trainable_params:
+        param_groups.append({'params': other_trainable_params, 'weight_decay': weight_decay})
+
+    return AdamW(param_groups, lr=learning_rate)
+
+
 def save_checkpoint(
     accelerator: Accelerator,
     model,
@@ -778,10 +814,11 @@ Examples:
     )
     
     # Setup optimizer
-    optimizer = AdamW(
-        model.parameters(),
-        lr=args.learning_rate,
-        weight_decay=args.weight_decay
+    optimizer = create_optimizer(
+        model,
+        learning_rate=args.learning_rate,
+        weight_decay=args.weight_decay,
+        language_id=language_id if args.train_mode == 'lang_only' else None,
     )
     
     # Setup learning rate scheduler
