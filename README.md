@@ -39,6 +39,7 @@ We release **Qwen3-TTS**, a series of powerful speech generation capabilities de
 - [Fine Tuning](#fine-tuning)
 - [Tokenizer Audit Tool](#tokenizer-audit-tool)
 - [Evaluation](#evaluation)
+- [Training New Language Proposal](#training-new-language-proposal)
 - [Citation](#citation)
 
 ## Overview
@@ -1414,6 +1415,12 @@ During evaluation, we ran inference for all models with `dtype=torch.bfloat16` a
 
 </details>
 
+
+## Training New Language Proposal
+
+For a practical, step-by-step rollout to add support for unsupported languages (e.g., Polish), see:
+
+- [`docs/TRAIN_NEW_LANGUAGE_PROPOSAL.md`](docs/TRAIN_NEW_LANGUAGE_PROPOSAL.md)
 
 ## Citation
 

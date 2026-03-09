@@ -266,54 +266,90 @@ def setup_lora_model(model, lora_config):
     return model
 
 
+def register_language_embedding_gradient_mask(model, language_id: int):
+    """
+    Register a gradient hook so only one language row in codec_embedding is updated.
+
+    Args:
+        model: Qwen3-TTS model with talker.model.codec_embedding
+        language_id: Row index in codec embedding to keep trainable
+
+    Returns:
+        torch.utils.hooks.RemovableHandle
+
+    Raises:
+        ValueError: If codec embedding is missing or language_id is out of range.
+    """
+    if not hasattr(model, 'talker') or not hasattr(model.talker, 'model'):
+        raise ValueError("Model does not have talker.model for language embedding masking")
+    if not hasattr(model.talker.model, 'codec_embedding'):
+        raise ValueError("Model does not have talker.model.codec_embedding")
+
+    embedding_weight = model.talker.model.codec_embedding.weight
+    vocab_size = embedding_weight.shape[0]
+    if language_id < 0 or language_id >= vocab_size:
+        raise ValueError(
+            f"language_id={language_id} out of codec_embedding range [0, {vocab_size - 1}]"
+        )
+
+    def _mask_grad(grad):
+        masked_grad = torch.zeros_like(grad)
+        masked_grad[language_id] = grad[language_id]
+        return masked_grad
+
+    return embedding_weight.register_hook(_mask_grad)
+
+
 def freeze_all_except_language_embeddings(model, language_id: Optional[int] = None):
     """
     Freeze all parameters except language embeddings and minimal adapters.
-    
-    For lang_only mode: only update the new language embedding row(s)
-    and a few adapter layers.
-    
+
+    For lang_only mode, this function optionally applies row-wise gradient
+    masking so only `language_id` in codec embedding is updated.
+
     Args:
         model: The model to freeze
         language_id: The specific language ID to train (if known)
+
+    Returns:
+        Optional hook handle for language-row gradient masking.
     """
     # Number of top layers to unfreeze for adaptation
     NUM_LAYERS_TO_UNFREEZE = 2
-    
+    language_row_hook = None
+
     # First, freeze everything
     for param in model.parameters():
         param.requires_grad = False
-    
+
     # Unfreeze codec embedding (where language tokens live)
     if hasattr(model, 'talker') and hasattr(model.talker, 'model'):
         if hasattr(model.talker.model, 'codec_embedding'):
-            # If we know the specific language ID, only unfreeze that row
+            model.talker.model.codec_embedding.weight.requires_grad = True
             if language_id is not None:
-                # We'll need to use a custom approach to only update specific rows
-                # For now, unfreeze the entire embedding and use masking during optimization
-                model.talker.model.codec_embedding.weight.requires_grad = True
-                print(f"Unfroze codec_embedding (will focus on language_id={language_id})")
+                language_row_hook = register_language_embedding_gradient_mask(model, language_id)
+                print(f"Unfroze codec_embedding with row-only gradient mask (language_id={language_id})")
             else:
-                # Unfreeze entire codec embedding
-                model.talker.model.codec_embedding.weight.requires_grad = True
-                print("Unfroze codec_embedding (all rows)")
-    
+                print("Unfroze codec_embedding (all rows; no language_id provided)")
+
     # Optionally unfreeze a few top layers for adaptation
     # This allows the model to adapt to the new language slightly
     num_layers = model.talker.model.config.num_hidden_layers
-    
+
     for i in range(num_layers - NUM_LAYERS_TO_UNFREEZE, num_layers):
         layer = model.talker.model.layers[i]
         for param in layer.parameters():
             param.requires_grad = True
-    
+
     print(f"Unfroze last {NUM_LAYERS_TO_UNFREEZE} transformer layers for adaptation")
-    
+
     # Print trainable parameters
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     total_params = sum(p.numel() for p in model.parameters())
     print(f"Trainable parameters: {trainable_params:,} / {total_params:,} "
           f"({100 * trainable_params / total_params:.2f}%)")
+
+    return language_row_hook
 
 
 def save_checkpoint(
@@ -684,6 +720,9 @@ Examples:
         model.gradient_checkpointing_enable()
         accelerator.print("Gradient checkpointing enabled")
     
+    # Keep optional language-row hook alive for entire training lifecycle.
+    language_row_hook = None
+
     # Apply training mode
     if args.train_mode == 'lora':
         accelerator.print("Setting up LoRA...")
@@ -710,7 +749,7 @@ Examples:
                     f"Consider running scripts/register_language.py first."
                 )
         
-        freeze_all_except_language_embeddings(model, language_id)
+        language_row_hook = freeze_all_except_language_embeddings(model, language_id)
     
     else:  # full
         accelerator.print("Using full fine-tuning mode")

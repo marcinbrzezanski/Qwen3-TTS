@@ -27,6 +27,7 @@ import torch
 from transformers import AutoConfig, AutoModel, AutoProcessor
 
 from ..core.models import Qwen3TTSConfig, Qwen3TTSForConditionalGeneration, Qwen3TTSProcessor
+from ..langs.registry import LanguageRegistry
 
 AudioLike = Union[
     str,                     # wav path, URL, base64
@@ -161,6 +162,20 @@ class Qwen3TTSModel:
                 bad.append(lang)
         if bad:
             raise ValueError(f"Unsupported languages: {bad}. Supported: {sorted(supported)}")
+
+    def _get_language_registry(self) -> LanguageRegistry:
+        codec_language_id = None
+        talker_config = getattr(self.model.config, "talker_config", None)
+        if talker_config is not None:
+            codec_language_id = getattr(talker_config, "codec_language_id", None)
+        return LanguageRegistry(codec_language_id)
+
+    def _normalize_languages(self, languages: List[str]) -> List[str]:
+        registry = self._get_language_registry()
+        normalized = []
+        for lang in languages:
+            normalized.append(registry.normalize_language(lang or "auto"))
+        return normalized
 
     def _validate_speakers(self, speakers: List[Optional[str]]) -> None:
         """
@@ -560,6 +575,7 @@ class Qwen3TTSModel:
         if len(texts) != len(languages):
             raise ValueError(f"Batch size mismatch: text={len(texts)}, language={len(languages)}")
 
+        languages = self._normalize_languages(languages)
         self._validate_languages(languages)
 
         if voice_clone_prompt is None:
@@ -703,6 +719,7 @@ class Qwen3TTSModel:
         if not (len(texts) == len(languages) == len(instructs)):
             raise ValueError(f"Batch size mismatch: text={len(texts)}, language={len(languages)}, instruct={len(instructs)}")
 
+        languages = self._normalize_languages(languages)
         self._validate_languages(languages)
 
         input_ids = self._tokenize_texts([self._build_assistant_text(t) for t in texts])
@@ -812,6 +829,7 @@ class Qwen3TTSModel:
                 f"Batch size mismatch: text={len(texts)}, language={len(languages)}, speaker={len(speakers)}, instruct={len(instructs)}"
             )
 
+        languages = self._normalize_languages(languages)
         self._validate_languages(languages)
         self._validate_speakers(speakers)
 
