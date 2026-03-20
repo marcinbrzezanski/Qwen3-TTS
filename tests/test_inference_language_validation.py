@@ -20,6 +20,7 @@ class _DummyConfig:
 class _DummyModel:
     def __init__(self, codec_language_id):
         self.config = _DummyConfig(codec_language_id)
+        self.device = "cpu"
 
     def get_supported_languages(self):
         return list(self.config.talker_config.codec_language_id.keys())
