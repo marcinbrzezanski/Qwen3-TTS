@@ -37,8 +37,9 @@ import argparse
 import json
 import os
 import sys
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional, Sequence, Tuple
 
 import torch
 from accelerate import Accelerator
@@ -54,6 +55,8 @@ sys.path.insert(0, str(parent_dir))
 # Import after path is set
 from qwen_tts.inference.qwen3_tts_model import Qwen3TTSModel
 from qwen_tts.core.models import Qwen3TTSForConditionalGeneration
+from qwen_tts.langs.registry import LanguageRegistry
+from tools.tokenizer_audit import analyze_tokenization
 
 # Try importing peft, but make it optional
 try:
@@ -63,6 +66,258 @@ except ImportError:
     PEFT_AVAILABLE = False
     LoraConfig = None
     get_peft_model = None
+
+
+ROLE_TOKEN_COUNT = 3
+SPEAKER_PLACEHOLDER_TOKEN_ID = 0
+NUM_CODEC_CHANNELS = 16
+IGNORE_INDEX = -100
+DEFAULT_LANGUAGE = "auto"
+CONFIG_FILES_TO_COPY = ["config.json", "generation_config.json", "tokenizer_config.json"]
+
+
+@dataclass(frozen=True)
+class TrainingSequenceLayout:
+    """Resolved layout for a single training sample."""
+
+    prompt_tokens: Tuple[int, ...]
+    prompt_start: int
+    prompt_end: int
+    speaker_position: int
+    text_start: int
+    text_end: int
+    text_eos_position: int
+    codec_bos_position: int
+    codec_start: int
+    codec_end: int
+    codec_eos_position: int
+    sequence_length: int
+
+
+def get_language_registry_from_config(config) -> LanguageRegistry:
+    """Build the shared language registry used by both training and inference."""
+    talker_config = getattr(config, "talker_config", None)
+    codec_language_id = getattr(talker_config, "codec_language_id", None) if talker_config is not None else None
+    return LanguageRegistry(codec_language_id)
+
+
+def resolve_training_language(
+    registry: LanguageRegistry,
+    sample_language: Optional[str],
+    target_language: Optional[str] = None,
+    *,
+    strict: bool = False,
+) -> Tuple[str, Optional[int]]:
+    """
+    Normalize and resolve the language used for conditioning in training.
+
+    `target_language` overrides per-sample language in the same way users expect at inference time.
+    """
+    requested_language = target_language if target_language is not None else sample_language
+    normalized_language = registry.normalize_language(requested_language or DEFAULT_LANGUAGE)
+    language_id = registry.resolve_language(normalized_language, strict=strict)
+    return normalized_language, language_id
+
+
+def validate_lang_only_target_language(config, target_language: Optional[str]) -> Tuple[str, int]:
+    """Require an explicit registered language token for lang_only training."""
+    if not target_language:
+        raise ValueError("lang_only mode requires --target_language to be set to a registered language.")
+
+    registry = get_language_registry_from_config(config)
+    normalized_language, language_id = resolve_training_language(
+        registry,
+        sample_language=None,
+        target_language=target_language,
+        strict=True,
+    )
+    if language_id is None:
+        raise ValueError(
+            f"Language '{normalized_language}' is not registered in talker_config.codec_language_id."
+        )
+    return normalized_language, language_id
+
+
+def build_codec_conditioning_tokens(config, language_id: Optional[int]) -> List[int]:
+    """Mirror inference-time language/speaker conditioning tokens for training."""
+    if language_id is None:
+        return [
+            config.talker_config.codec_nothink_id,
+            config.talker_config.codec_think_bos_id,
+            config.talker_config.codec_think_eos_id,
+            SPEAKER_PLACEHOLDER_TOKEN_ID,
+            config.talker_config.codec_pad_id,
+            config.talker_config.codec_bos_id,
+        ]
+
+    return [
+        config.talker_config.codec_think_id,
+        config.talker_config.codec_think_bos_id,
+        language_id,
+        config.talker_config.codec_think_eos_id,
+        SPEAKER_PLACEHOLDER_TOKEN_ID,
+        config.talker_config.codec_pad_id,
+        config.talker_config.codec_bos_id,
+    ]
+
+
+def build_training_sequence_layout(text_ids_len: int, codec_ids_len: int, prompt_tokens: Sequence[int]) -> TrainingSequenceLayout:
+    """Return named positions for the collate_fn sequence layout."""
+    prompt_positions = len(prompt_tokens) - 1
+    prompt_start = ROLE_TOKEN_COUNT
+    prompt_end = prompt_start + prompt_positions
+    text_start = prompt_end
+    text_payload_len = text_ids_len - ROLE_TOKEN_COUNT
+    text_end = text_start + text_payload_len
+    text_eos_position = text_end
+    codec_bos_position = text_eos_position + 1
+    codec_start = codec_bos_position + 1
+    codec_end = codec_start + codec_ids_len
+    codec_eos_position = codec_end
+    sequence_length = codec_eos_position + 1
+
+    return TrainingSequenceLayout(
+        prompt_tokens=tuple(prompt_tokens),
+        prompt_start=prompt_start,
+        prompt_end=prompt_end,
+        speaker_position=prompt_start + (len(prompt_tokens) - 3),
+        text_start=text_start,
+        text_end=text_end,
+        text_eos_position=text_eos_position,
+        codec_bos_position=codec_bos_position,
+        codec_start=codec_start,
+        codec_end=codec_end,
+        codec_eos_position=codec_eos_position,
+        sequence_length=sequence_length,
+    )
+
+
+def find_unregistered_training_languages(
+    train_data: Sequence[dict],
+    registry: LanguageRegistry,
+    target_language: Optional[str],
+) -> List[str]:
+    """List normalized languages in training data that are not registered in the codec mapping."""
+    if target_language:
+        normalized, language_id = resolve_training_language(
+            registry,
+            sample_language=None,
+            target_language=target_language,
+            strict=False,
+        )
+        if normalized != DEFAULT_LANGUAGE and language_id is None:
+            return [normalized]
+        return []
+
+    missing = set()
+    for item in train_data:
+        normalized, language_id = resolve_training_language(
+            registry,
+            sample_language=item.get("language", DEFAULT_LANGUAGE),
+            target_language=None,
+            strict=False,
+        )
+        if normalized != DEFAULT_LANGUAGE and language_id is None:
+            missing.add(normalized)
+    return sorted(missing)
+
+
+def run_tokenizer_preflight_audit(
+    processor,
+    train_data: Sequence[dict],
+    languages: Sequence[str],
+    output_dir: str,
+    max_samples: int = 128,
+):
+    """Audit tokenizer behavior on training texts before training an unregistered language."""
+    if not languages:
+        return None
+
+    tokenizer = getattr(processor, "tokenizer", None)
+    if tokenizer is None:
+        print("Skipping tokenizer preflight audit: processor does not expose a tokenizer.")
+        return None
+
+    samples = [item["text"] for item in train_data[:max_samples] if item.get("text")]
+    if not samples:
+        print("Skipping tokenizer preflight audit: no training texts available.")
+        return None
+
+    analyses = [analyze_tokenization(tokenizer, text) for text in samples]
+    avg_tokens_per_char = sum(item["tokens_per_char"] for item in analyses) / len(analyses)
+    max_sequence_length = max(item["num_tokens"] for item in analyses)
+    total_unk_tokens = sum(item["num_unk_tokens"] for item in analyses)
+    lossless_count = sum(1 for item in analyses if item["is_lossless"])
+    summary = {
+        "languages": list(languages),
+        "num_samples": len(analyses),
+        "avg_tokens_per_char": avg_tokens_per_char,
+        "max_sequence_length": max_sequence_length,
+        "total_unk_tokens": total_unk_tokens,
+        "lossless_encoding_rate": lossless_count / len(analyses),
+    }
+
+    os.makedirs(output_dir, exist_ok=True)
+    output_path = os.path.join(output_dir, "tokenizer_audit_preflight.json")
+    with open(output_path, "w", encoding="utf-8") as f:
+        json.dump({"summary": summary, "samples": analyses}, f, indent=2, ensure_ascii=False)
+
+    print(
+        "Tokenizer preflight audit for unregistered language(s) "
+        f"{', '.join(languages)}: avg_tokens_per_char={avg_tokens_per_char:.3f}, "
+        f"max_sequence_length={max_sequence_length}, total_unk_tokens={total_unk_tokens}, "
+        f"lossless={lossless_count}/{len(analyses)}. Saved to {output_path}"
+    )
+    return summary
+
+
+def forward_training_batch(model, batch):
+    """Shared forward path for training and tests."""
+    input_ids = batch["input_ids"]
+    codec_ids = batch["codec_ids"]
+    ref_mels = batch["ref_mels"]
+    text_embedding_mask = batch["text_embedding_mask"]
+    codec_embedding_mask = batch["codec_embedding_mask"]
+    attention_mask = batch["attention_mask"]
+    codec_0_labels = batch["codec_0_labels"]
+    codec_mask = batch["codec_mask"]
+
+    speaker_embedding = model.speaker_encoder(
+        ref_mels.to(model.device).to(model.dtype)
+    ).detach()
+
+    input_text_ids = input_ids[:, :, 0]
+    input_codec_ids = input_ids[:, :, 1]
+
+    input_text_embedding = model.talker.model.text_embedding(input_text_ids) * text_embedding_mask
+    input_codec_embedding = model.talker.model.codec_embedding(input_codec_ids) * codec_embedding_mask
+    row_indices = torch.arange(input_codec_embedding.shape[0], device=input_codec_embedding.device)
+    speaker_positions = batch["speaker_positions"].to(input_codec_embedding.device)
+    input_codec_embedding[row_indices, speaker_positions, :] = speaker_embedding
+
+    input_embeddings = input_text_embedding + input_codec_embedding
+
+    for i in range(1, NUM_CODEC_CHANNELS):
+        codec_i_embedding = model.talker.code_predictor.get_input_embeddings()[i - 1](codec_ids[:, :, i])
+        codec_i_embedding = codec_i_embedding * codec_mask.unsqueeze(-1)
+        input_embeddings = input_embeddings + codec_i_embedding
+
+    outputs = model.talker(
+        inputs_embeds=input_embeddings[:, :-1, :],
+        attention_mask=attention_mask[:, :-1],
+        labels=codec_0_labels[:, 1:],
+        output_hidden_states=True,
+    )
+
+    hidden_states = outputs.hidden_states[0][-1]
+    talker_hidden_states = hidden_states[codec_mask[:, 1:]]
+    talker_codec_ids = codec_ids[codec_mask]
+    _, sub_talker_loss = model.talker.forward_sub_talker_finetune(
+        talker_codec_ids,
+        talker_hidden_states,
+    )
+
+    return outputs.loss + sub_talker_loss
 
 
 class LanguageDataset(torch.utils.data.Dataset):
@@ -82,6 +337,7 @@ class LanguageDataset(torch.utils.data.Dataset):
         self.processor = processor
         self.config = config
         self.target_language = target_language
+        self.language_registry = get_language_registry_from_config(config)
         
         # Import here to avoid circular dependencies
         import librosa
@@ -136,8 +392,14 @@ class LanguageDataset(torch.utils.data.Dataset):
         audio_path = item["audio"]
         text = item["text"]
         audio_codes = item["audio_codes"]
-        language = item.get('language', 'auto')
+        language = item.get('language', DEFAULT_LANGUAGE)
         ref_audio_path = item['ref_audio']
+        normalized_language, language_id = resolve_training_language(
+            self.language_registry,
+            sample_language=language,
+            target_language=self.target_language,
+            strict=False,
+        )
         
         text = self._build_assistant_text(text)
         text_ids = self._tokenize_texts(text)
@@ -155,66 +417,69 @@ class LanguageDataset(torch.utils.data.Dataset):
             "text_ids": text_ids[:, :-5],
             "audio_codes": audio_codes,
             "ref_mel": ref_mel,
-            "language": language
+            "language": normalized_language,
+            "language_id": language_id,
         }
     
     def collate_fn(self, batch):
         """Collate function for DataLoader."""
-        item_length = [b['text_ids'].shape[1] + b['audio_codes'].shape[0] for b in batch]
-        max_length = max(item_length) + 8
+        layouts = []
+        for data in batch:
+            prompt_tokens = build_codec_conditioning_tokens(self.config, data.get("language_id"))
+            layouts.append(
+                build_training_sequence_layout(
+                    text_ids_len=data["text_ids"].shape[1],
+                    codec_ids_len=data["audio_codes"].shape[0],
+                    prompt_tokens=prompt_tokens,
+                )
+            )
+
+        max_length = max(layout.sequence_length for layout in layouts)
         b, t = len(batch), max_length
-        
+
         input_ids = torch.zeros((b, t, 2), dtype=torch.long)
-        codec_ids = torch.zeros((b, t, 16), dtype=torch.long)
+        codec_ids = torch.zeros((b, t, NUM_CODEC_CHANNELS), dtype=torch.long)
         text_embedding_mask = torch.zeros((b, t), dtype=torch.bool)
         codec_embedding_mask = torch.zeros((b, t), dtype=torch.bool)
         codec_mask = torch.zeros((b, t), dtype=torch.bool)
         attention_mask = torch.zeros((b, t), dtype=torch.long)
-        codec_0_labels = torch.full((b, t), -100, dtype=torch.long)
-        
-        for i, data in enumerate(batch):
+        codec_0_labels = torch.full((b, t), IGNORE_INDEX, dtype=torch.long)
+        speaker_positions = torch.zeros((b,), dtype=torch.long)
+
+        for i, (data, layout) in enumerate(zip(batch, layouts)):
             text_ids = data['text_ids']
             audio_codec_0 = data['audio_codes'][:, 0]
             audio_codecs = data['audio_codes']
-            
-            text_ids_len = text_ids.shape[1]
-            codec_ids_len = audio_codec_0.shape[0]
-            
-            # text channel
-            input_ids[i, :3, 0] = text_ids[0, :3]
-            input_ids[i, 3:7, 0] = self.config.tts_pad_token_id
-            input_ids[i, 7, 0] = self.config.tts_bos_token_id
-            input_ids[i, 8:8+text_ids_len-3, 0] = text_ids[0, 3:]
-            input_ids[i, 8+text_ids_len-3, 0] = self.config.tts_eos_token_id
-            input_ids[i, 8+text_ids_len-2:8+text_ids_len+codec_ids_len, 0] = self.config.tts_pad_token_id
-            text_embedding_mask[i, :8+text_ids_len+codec_ids_len] = True
-            
-            # codec channel
-            # Position 6 is reserved for speaker embedding (value 0 is placeholder)
-            input_ids[i, 3:8, 1] = torch.tensor([
-                self.config.talker_config.codec_nothink_id,
-                self.config.talker_config.codec_think_bos_id,
-                self.config.talker_config.codec_think_eos_id,
-                0,  # speaker embedding placeholder
-                self.config.talker_config.codec_pad_id
-            ])
-            input_ids[i, 8:8+text_ids_len-3, 1] = self.config.talker_config.codec_pad_id
-            input_ids[i, 8+text_ids_len-3, 1] = self.config.talker_config.codec_pad_id
-            input_ids[i, 8+text_ids_len-2, 1] = self.config.talker_config.codec_bos_id
-            input_ids[i, 8+text_ids_len-1:8+text_ids_len-1+codec_ids_len, 1] = audio_codec_0
-            input_ids[i, 8+text_ids_len-1+codec_ids_len, 1] = self.config.talker_config.codec_eos_token_id
-            
-            codec_0_labels[i, 8+text_ids_len-1:8+text_ids_len-1+codec_ids_len] = audio_codec_0
-            codec_0_labels[i, 8+text_ids_len-1+codec_ids_len] = self.config.talker_config.codec_eos_token_id
-            
-            codec_ids[i, 8+text_ids_len-1:8+text_ids_len-1+codec_ids_len, :] = audio_codecs
-            
-            codec_embedding_mask[i, 3:8+text_ids_len+codec_ids_len] = True
-            codec_embedding_mask[i, 6] = False  # for speaker embedding
-            
-            codec_mask[i, 8+text_ids_len-1:8+text_ids_len-1+codec_ids_len] = True
-            attention_mask[i, :8+text_ids_len+codec_ids_len] = True
-        
+
+            input_ids[i, :ROLE_TOKEN_COUNT, 0] = text_ids[0, :ROLE_TOKEN_COUNT]
+            input_ids[i, layout.prompt_start:layout.prompt_end, 0] = self.config.tts_pad_token_id
+            input_ids[i, layout.prompt_end - 1, 0] = self.config.tts_bos_token_id
+            input_ids[i, layout.text_start:layout.text_end, 0] = text_ids[0, ROLE_TOKEN_COUNT:]
+            input_ids[i, layout.text_eos_position, 0] = self.config.tts_eos_token_id
+            input_ids[i, layout.codec_bos_position:layout.codec_eos_position + 1, 0] = self.config.tts_pad_token_id
+            text_embedding_mask[i, :layout.sequence_length] = True
+
+            input_ids[i, layout.prompt_start:layout.prompt_end, 1] = torch.tensor(
+                layout.prompt_tokens[:-1],
+                dtype=torch.long,
+            )
+            input_ids[i, layout.text_start:layout.text_eos_position + 1, 1] = self.config.talker_config.codec_pad_id
+            input_ids[i, layout.codec_bos_position, 1] = self.config.talker_config.codec_bos_id
+            input_ids[i, layout.codec_start:layout.codec_end, 1] = audio_codec_0
+            input_ids[i, layout.codec_eos_position, 1] = self.config.talker_config.codec_eos_token_id
+
+            codec_0_labels[i, layout.codec_start:layout.codec_end] = audio_codec_0
+            codec_0_labels[i, layout.codec_eos_position] = self.config.talker_config.codec_eos_token_id
+
+            codec_ids[i, layout.codec_start:layout.codec_end, :] = audio_codecs
+
+            codec_embedding_mask[i, layout.prompt_start:layout.codec_eos_position + 1] = True
+            codec_embedding_mask[i, layout.speaker_position] = False
+
+            codec_mask[i, layout.codec_start:layout.codec_end] = True
+            attention_mask[i, :layout.sequence_length] = True
+            speaker_positions[i] = layout.speaker_position
+
         ref_mels = [data['ref_mel'] for data in batch]
         ref_mels = torch.cat(ref_mels, dim=0)
         
@@ -226,7 +491,8 @@ class LanguageDataset(torch.utils.data.Dataset):
             'codec_embedding_mask': codec_embedding_mask.unsqueeze(-1),
             'codec_0_labels': codec_0_labels,
             'codec_ids': codec_ids,
-            'codec_mask': codec_mask
+            'codec_mask': codec_mask,
+            'speaker_positions': speaker_positions,
         }
 
 
@@ -423,8 +689,7 @@ def save_checkpoint(
     
     # Copy config and other files from original model
     import shutil
-    config_files = ['config.json', 'generation_config.json', 'tokenizer_config.json']
-    for config_file in config_files:
+    for config_file in CONFIG_FILES_TO_COPY:
         src = os.path.join(model_path, config_file)
         if os.path.exists(src):
             dst = os.path.join(checkpoint_dir, config_file)
@@ -456,12 +721,6 @@ def save_checkpoint(
     else:
         # Save full model state dict
         state_dict = {k: v.detach().cpu() for k, v in unwrapped_model.state_dict().items()}
-        
-        # Don't save speaker encoder if it exists (it's frozen anyway)
-        keys_to_drop = [k for k in state_dict.keys() if k.startswith('speaker_encoder')]
-        for k in keys_to_drop:
-            del state_dict[k]
-        
         save_path = os.path.join(checkpoint_dir, "model.safetensors")
         save_file(state_dict, save_path)
     
@@ -756,6 +1015,10 @@ Examples:
         model.gradient_checkpointing_enable()
         accelerator.print("Gradient checkpointing enabled")
     
+    registry = get_language_registry_from_config(config)
+    normalized_target_language = None
+    language_id = None
+
     # Keep optional language-row hook alive for entire training lifecycle.
     language_row_hook = None
 
@@ -771,20 +1034,10 @@ Examples:
     
     elif args.train_mode == 'lang_only':
         accelerator.print("Setting up lang_only mode (freezing most parameters)...")
-        
-        # Try to get language_id if target_language is specified
-        language_id = None
-        if args.target_language and hasattr(config, 'talker_config'):
-            codec_language_id = getattr(config.talker_config, 'codec_language_id', None)
-            if codec_language_id and args.target_language.lower() in codec_language_id:
-                language_id = codec_language_id[args.target_language.lower()]
-                accelerator.print(f"Found language_id={language_id} for '{args.target_language}'")
-            else:
-                accelerator.print(
-                    f"Warning: Language '{args.target_language}' not found in model config. "
-                    f"Consider running scripts/register_language.py first."
-                )
-        
+        normalized_target_language, language_id = validate_lang_only_target_language(config, args.target_language)
+        accelerator.print(
+            f"Using registered language token '{normalized_target_language}' (language_id={language_id})"
+        )
         language_row_hook = freeze_all_except_language_embeddings(model, language_id)
     
     else:  # full
@@ -797,6 +1050,19 @@ Examples:
         train_data = [json.loads(line) for line in f if line.strip()]
     
     accelerator.print(f"Loaded {len(train_data)} training samples")
+
+    unregistered_languages = find_unregistered_training_languages(
+        train_data,
+        registry,
+        normalized_target_language or args.target_language,
+    )
+    if unregistered_languages:
+        run_tokenizer_preflight_audit(
+            qwen3tts.processor,
+            train_data,
+            unregistered_languages,
+            args.output_dir,
+        )
     
     # Create dataset and dataloader
     dataset = LanguageDataset(
@@ -870,61 +1136,7 @@ Examples:
         
         for step, batch in enumerate(train_dataloader):
             with accelerator.accumulate(model):
-                # Prepare inputs
-                input_ids = batch['input_ids']
-                codec_ids = batch['codec_ids']
-                ref_mels = batch['ref_mels']
-                text_embedding_mask = batch['text_embedding_mask']
-                codec_embedding_mask = batch['codec_embedding_mask']
-                attention_mask = batch['attention_mask']
-                codec_0_labels = batch['codec_0_labels']
-                codec_mask = batch['codec_mask']
-                
-                # Get speaker embedding (frozen - not trained during language fine-tuning)
-                speaker_embedding = model.speaker_encoder(
-                    ref_mels.to(model.device).to(model.dtype)
-                ).detach()
-                
-                # Prepare embeddings
-                input_text_ids = input_ids[:, :, 0]
-                input_codec_ids = input_ids[:, :, 1]
-                
-                input_text_embedding = model.talker.model.text_embedding(input_text_ids) * text_embedding_mask
-                input_codec_embedding = model.talker.model.codec_embedding(input_codec_ids) * codec_embedding_mask
-                input_codec_embedding[:, 6, :] = speaker_embedding
-                
-                input_embeddings = input_text_embedding + input_codec_embedding
-                
-                # Add codec embeddings for all 15 remaining codec channels (1-15)
-                # The model uses 16 total codec channels (0-15)
-                NUM_CODEC_CHANNELS = 16
-                for i in range(1, NUM_CODEC_CHANNELS):
-                    codec_i_embedding = model.talker.code_predictor.get_input_embeddings()[i - 1](
-                        codec_ids[:, :, i]
-                    )
-                    codec_i_embedding = codec_i_embedding * codec_mask.unsqueeze(-1)
-                    input_embeddings = input_embeddings + codec_i_embedding
-                
-                # Forward pass
-                outputs = model.talker(
-                    inputs_embeds=input_embeddings[:, :-1, :],
-                    attention_mask=attention_mask[:, :-1],
-                    labels=codec_0_labels[:, 1:],
-                    output_hidden_states=True
-                )
-                
-                # Sub-talker loss
-                hidden_states = outputs.hidden_states[0][-1]
-                talker_hidden_states = hidden_states[codec_mask[:, 1:]]
-                talker_codec_ids = codec_ids[codec_mask]
-                
-                sub_talker_logits, sub_talker_loss = model.talker.forward_sub_talker_finetune(
-                    talker_codec_ids,
-                    talker_hidden_states
-                )
-                
-                # Total loss
-                loss = outputs.loss + sub_talker_loss
+                loss = forward_training_batch(model, batch)
                 
                 # Backward pass
                 accelerator.backward(loss)

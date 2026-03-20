@@ -6,9 +6,11 @@ This guide explains how to fine-tune Qwen3-TTS models for new language support u
 
 The language fine-tuning script provides three training modes optimized for different scenarios:
 
-1. **`lang_only`**: Most efficient - only updates language embedding row(s) and minimal adapters (~1-2% of parameters)
-2. **`lora`**: Efficient - uses LoRA (Low-Rank Adaptation) for parameter-efficient fine-tuning (~5-10% of parameters)
-3. **`full`**: Complete - full model fine-tuning (all parameters, highest quality but most resource-intensive)
+1. **`lang_only`**: Updates the resolved language embedding row plus the top 2 talker layers. This mode now requires `--target_language` to resolve to an existing entry in `talker_config.codec_language_id`.
+2. **`lora`**: Uses LoRA (Low-Rank Adaptation) for parameter-efficient fine-tuning while sharing the same language normalization and language-token mapping path as inference.
+3. **`full`**: Full-model fine-tuning with the same language normalization and language-token mapping path as inference.
+
+Across all modes, dataset `language` values are normalized with the shared `LanguageRegistry` used by inference (`pl`, `pl-PL`, and `Polish` all resolve to `polish`). If a target language is not registered, `full` and `lora` fall back to `language="auto"` and emit a tokenizer preflight audit before training.
 
 ## Prerequisites
 
@@ -49,9 +51,9 @@ Example:
 
 ## Quick Start
 
-### 1. Language Embedding Only (Recommended for New Languages)
+### 1. Language Embedding Only (Recommended After Registration)
 
-Best for: Adding a completely new language with limited data (10-100 samples)
+Best for: Adapting a newly registered language with limited data (10-100 samples)
 
 ```bash
 python scripts/finetune_language.py \
@@ -66,7 +68,7 @@ python scripts/finetune_language.py \
 ```
 
 **Key parameters:**
-- `--train_mode lang_only`: Only update language embeddings and top 2 layers
+- `--train_mode lang_only`: Only update the resolved language embedding row and the top 2 layers
 - `--learning_rate 1e-4`: Higher LR is safe since we're only training a small subset
 - `--num_epochs 10`: More epochs needed with minimal parameters
 
@@ -118,18 +120,18 @@ python scripts/finetune_language.py \
 
 ## Training for Unknown Languages
 
-If your language is not registered in the model, you can still fine-tune! The model will use "auto" language detection:
+If your language is not registered in the model, `full` and `lora` training can still proceed. The script normalizes the dataset language with the shared registry, falls back to `"auto"` conditioning, and writes a tokenizer preflight audit before training starts:
 
 ```bash
 python scripts/finetune_language.py \
   --init_model_path Qwen/Qwen3-TTS-12Hz-1.7B-Base \
   --train_jsonl data/unknown_lang_train_with_codes.jsonl \
   --output_dir output/unknown_lang \
-  --train_mode lang_only \
+  --train_mode full \
   --num_epochs 10
 ```
 
-**Note:** For better results, consider registering your language first using `scripts/register_language.py`:
+**Note:** `lang_only` now requires registration first, and it is still the recommended path for explicit language conditioning. Use `scripts/register_language.py` before starting `lang_only`:
 
 ```bash
 python scripts/register_language.py \
@@ -174,6 +176,8 @@ Built-in linear warmup + decay:
 --save_steps 500          # Save every N steps (in addition to epoch saves)
 --resume_from_checkpoint output/polish_lora/checkpoint-epoch-2  # Resume training
 ```
+
+Checkpoints now keep the full model state by default, including `speaker_encoder` weights.
 
 ### Logging
 
@@ -289,8 +293,8 @@ Try these in order:
 ### Language Not Recognized
 
 If you get a warning about language not found:
-1. Run `scripts/register_language.py` first to add the language token
-2. Or simply omit `--target_language` and the model will use "auto" mode
+1. Run `scripts/register_language.py` first to add the language token if you want explicit conditioning or `lang_only` mode
+2. Otherwise omit `--target_language` (or leave dataset languages unregistered) and the script will train with `"auto"` conditioning after running the tokenizer preflight audit
 
 ## Hardware Requirements
 
