@@ -467,9 +467,11 @@ Fine-tune the model on a new speaker's voice. Please refer to [Qwen3-TTS-Finetun
 
 ### Language Fine-Tuning
 Fine-tune the model for new language support with three training modes:
-- **`lang_only`**: Most efficient - only updates language embeddings (~1-2% of parameters)
-- **`lora`**: Efficient - uses LoRA for parameter-efficient fine-tuning (~5-10% of parameters)  
-- **`full`**: Complete - full model fine-tuning (all parameters, highest quality)
+- **`lang_only`**: Updates the registered language embedding row plus the top 2 talker layers. This mode now requires `--target_language` to already exist in `talker_config.codec_language_id`.
+- **`lora`**: Uses LoRA for parameter-efficient fine-tuning. If `--target_language` is registered, training uses the same language-token conditioning path as inference; otherwise it falls back to `language="auto"`.
+- **`full`**: Full-model fine-tuning with the same language normalization and conditioning rules as inference.
+
+When `--target_language` (or dataset `language`) is not registered, the training script now runs a tokenizer preflight audit on the training texts and stores the summary in `tokenizer_audit_preflight.json` before training continues. Checkpoints also keep `speaker_encoder` weights by default.
 
 Quick example:
 ```bash
@@ -487,7 +489,7 @@ For comprehensive documentation, see [Language Fine-Tuning Guide](docs/LANGUAGE_
 
 ## Tokenizer Audit Tool
 
-For developers working with new languages or evaluating tokenizer performance, we provide a tokenizer audit tool that analyzes the **text tokenizer** (Qwen2Tokenizer) efficiency and coverage.
+For developers working with new languages or evaluating tokenizer performance, we provide a tokenizer audit tool that analyzes the **text tokenizer** (Qwen2Tokenizer) efficiency and coverage. The fine-tuning script also runs a smaller preflight audit automatically when training data targets an unregistered language.
 
 ### Purpose
 
